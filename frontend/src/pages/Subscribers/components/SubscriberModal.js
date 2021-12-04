@@ -169,13 +169,6 @@ class SubscriberModal extends Component {
   };
 
   state = {
-    editMode: false,
-    formData: undefined,
-    // for force re-rendering json form
-    rerenderCounter: 0,
-  };
-
-  state = {
     formData: undefined,
     editMode: false,
     // for force re-rendering json form

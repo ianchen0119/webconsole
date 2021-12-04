@@ -22,9 +22,31 @@ class TasksOverview extends Component {
     this.refreshEnabled = false;
   }
 
-  componentWillReceiveProps(nextProps) {
-    let urlParams = queryString.parse(this.props.location.search);
+  // Notice: componentWillReceiveProps is deprecated since React 16.9.0
+  // componentWillReceiveProps(nextProps) {
+  //   let urlParams = queryString.parse(this.props.location.search);
 
+  //   if (urlParams['target'] !== undefined) {
+  //     let dashedUuid = AppUtils.dashUuid(urlParams['target']);
+  //     if (this.targetTaskUuid !== dashedUuid) {
+  //       this.targetTaskUuid = dashedUuid;
+  //       this.targetDownloaded = false;
+  //     }
+  //   }
+
+  //   // Track the target task
+  //   /*
+  //   if (this.targetTaskUuid !== null && !this.targetDownloaded && nextProps.tasksMap[this.targetTaskUuid] !== undefined) {
+  //     let task = nextProps.tasksMap[this.targetTaskUuid];
+  //     if (task['queue_status'] === Constants.QueueStatus.FINISHED) {
+  //       // TODO
+  //       this.targetDownloaded = true;
+  //     }
+  //   } */
+  // }
+
+  static getDerivedStateFromProps(nextProps, prevState){
+    let urlParams = queryString.parse(nextProps.location.search);
     if (urlParams['target'] !== undefined) {
       let dashedUuid = AppUtils.dashUuid(urlParams['target']);
       if (this.targetTaskUuid !== dashedUuid) {
@@ -32,16 +54,6 @@ class TasksOverview extends Component {
         this.targetDownloaded = false;
       }
     }
-
-    // Track the target task
-    /*
-    if (this.targetTaskUuid !== null && !this.targetDownloaded && nextProps.tasksMap[this.targetTaskUuid] !== undefined) {
-      let task = nextProps.tasksMap[this.targetTaskUuid];
-      if (task['queue_status'] === Constants.QueueStatus.FINISHED) {
-        // TODO
-        this.targetDownloaded = true;
-      }
-    } */
   }
 
   async updateTasksTable() {
