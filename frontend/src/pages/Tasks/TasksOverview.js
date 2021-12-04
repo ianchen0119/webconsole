@@ -13,7 +13,7 @@ class TasksOverview extends Component {
     this.targetDownloaded = false;
   }
 
-  componentWillMount() {
+  componentDidMount() {
     this.refreshEnabled = true;
     this.updateTasksTable().then();
   }
