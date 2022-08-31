@@ -2,15 +2,9 @@ package webui_service
 
 import (
 	"github.com/gin-gonic/gin"
-
-	"github.com/free5gc/path_util"
 )
 
-var PublicPath string
-
-func init() {
-	PublicPath = path_util.Free5gcPath("free5gc/webconsole/public")
-}
+var PublicPath = "public"
 
 func ReturnPublic() gin.HandlerFunc {
 	return func(context *gin.Context) {

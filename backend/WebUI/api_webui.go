@@ -5,13 +5,20 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"os"
+	"reflect"
 	"strings"
+	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/golang-jwt/jwt"
+	"github.com/google/uuid"
+	"github.com/pkg/errors"
 	"go.mongodb.org/mongo-driver/bson"
+	"golang.org/x/crypto/bcrypt"
 
-	"github.com/free5gc/MongoDBLibrary"
 	"github.com/free5gc/openapi/models"
+	"github.com/free5gc/util/mongoapi"
 	"github.com/free5gc/webconsole/backend/logger"
 	"github.com/free5gc/webconsole/backend/webui_context"
 )
@@ -24,6 +31,8 @@ const (
 	amPolicyDataColl = "policyData.ues.amData"
 	smPolicyDataColl = "policyData.ues.smData"
 	flowRuleDataColl = "policyData.ues.flowRule"
+	userDataColl     = "userData"
+	tenantDataColl   = "tenantData"
 )
 
 var httpsClient *http.Client
@@ -77,6 +86,50 @@ func sendResponseToClient(c *gin.Context, response *http.Response) {
 	var jsonData interface{}
 	json.NewDecoder(response.Body).Decode(&jsonData)
 	c.JSON(response.StatusCode, jsonData)
+}
+
+func sendResponseToClientFilterTenant(c *gin.Context, response *http.Response, tenantId string) {
+	// Subscription data.
+	filterTenantIdOnly := bson.M{"tenantId": tenantId}
+	amDataList, err := mongoapi.RestfulAPIGetMany(amDataColl, filterTenantIdOnly)
+	if err != nil {
+		logger.WebUILog.Errorf("sendResponseToClientFilterTenant err: %+v", err)
+	}
+
+	tenantCheck := func(supi string) bool {
+		for _, amData := range amDataList {
+			if supi == amData["ueId"] {
+				return true
+			}
+		}
+		return false
+	}
+
+	// Response data.
+	var jsonData interface{}
+	json.NewDecoder(response.Body).Decode(&jsonData)
+
+	s := reflect.ValueOf(jsonData)
+	if s.Kind() != reflect.Slice {
+		c.JSON(response.StatusCode, jsonData)
+		return
+	}
+
+	var sliceData []interface{}
+	for i := 0; i < s.Len(); i++ {
+		mapData := s.Index(i).Interface()
+		m := reflect.ValueOf(mapData)
+		for _, key := range m.MapKeys() {
+			if key.String() == "Supi" {
+				strct := m.MapIndex(key)
+				if tenantCheck(strct.Interface().(string)) {
+					sliceData = append(sliceData, mapData)
+				}
+			}
+		}
+	}
+
+	c.JSON(response.StatusCode, sliceData)
 }
 
 func GetSampleJSON(c *gin.Context) {
@@ -270,24 +323,518 @@ func GetSampleJSON(c *gin.Context) {
 	c.JSON(http.StatusOK, subsData)
 }
 
+type OAuth struct {
+	AccessToken  string `json:"access_token"`
+	RefreshToken string `json:"refresh_token"`
+	TokenType    string `json:"token_type"`
+	ExpiresIn    int    `json:"expires_in"`
+}
+
+type LoginRequest struct {
+	Username string `json:"username"`
+	Password string `json:"password"`
+}
+
+func JWT(email, userId, tenantId string) string {
+	token := jwt.New(jwt.SigningMethodHS256)
+
+	claims := token.Claims.(jwt.MapClaims)
+	claims["sub"] = userId
+	claims["iat"] = time.Now()
+	claims["exp"] = time.Now().Add(time.Hour * 24).Unix()
+	claims["email"] = email
+	claims["tenantId"] = tenantId
+
+	tokenString, _ := token.SignedString([]byte(os.Getenv("SIGNINGKEY")))
+
+	return tokenString
+}
+
+func generateHash(password string) {
+	hash, _ := bcrypt.GenerateFromPassword([]byte(password), 12)
+	logger.WebUILog.Warnln("Password hash:", hash)
+}
+
+func Login(c *gin.Context) {
+	setCorsHeader(c)
+
+	login := LoginRequest{}
+	err := json.NewDecoder(c.Request.Body).Decode(&login)
+	if err != nil {
+		logger.WebUILog.Warnln("JSON decode error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{})
+		return
+	}
+
+	generateHash(login.Password)
+
+	filterEmail := bson.M{"email": login.Username}
+	userData, err := mongoapi.RestfulAPIGetOne(userDataColl, filterEmail)
+	if err != nil {
+		logger.WebUILog.Errorf("Login err: %+v", err)
+	}
+
+	if len(userData) == 0 {
+		logger.WebUILog.Warnln("Can't find user email", login.Username)
+		c.JSON(http.StatusForbidden, gin.H{})
+		return
+	}
+
+	hash := userData["encryptedPassword"].(string)
+
+	err = bcrypt.CompareHashAndPassword([]byte(hash), []byte(login.Password))
+	if err != nil {
+		logger.WebUILog.Warnln("Password incorrect", login.Username)
+		c.JSON(http.StatusForbidden, gin.H{})
+		return
+	}
+
+	userId := userData["userId"].(string)
+	tenantId := userData["tenantId"].(string)
+
+	logger.WebUILog.Warnln("Login success", login.Username)
+	logger.WebUILog.Warnln("userid", userId)
+	logger.WebUILog.Warnln("tenantid", tenantId)
+
+	token := JWT(login.Username, userId, tenantId)
+	logger.WebUILog.Warnln("token", token)
+
+	oauth := OAuth{}
+	oauth.AccessToken = token
+	c.JSON(http.StatusOK, oauth)
+}
+
+// Placeholder to handle logout.
+func Logout(c *gin.Context) {
+	setCorsHeader(c)
+	// Needs to invalidate access_token.
+	c.JSON(http.StatusOK, gin.H{})
+}
+
+type AuthSub struct {
+	models.AuthenticationSubscription
+	TenantId string `json:"tenantId" bson:"tenantId"`
+}
+
+// Parse JWT
+func ParseJWT(tokenStr string) (jwt.MapClaims, error) {
+	token, err := jwt.Parse(tokenStr, func(token *jwt.Token) (interface{}, error) {
+		return []byte(os.Getenv("SIGNINGKEY")), nil
+	})
+
+	if err != nil {
+		return nil, errors.Wrap(err, "ParseJWT error")
+	}
+
+	claims, _ := token.Claims.(jwt.MapClaims)
+
+	return claims, nil
+}
+
+// Check of admin user. This should be done with proper JWT token.
+func CheckAuth(c *gin.Context) bool {
+	tokenStr := c.GetHeader("Token")
+	if tokenStr == "admin" {
+		return true
+	} else {
+		return false
+	}
+}
+
+// Tenat ID
+func GetTenantId(c *gin.Context) (string, error) {
+	tokenStr := c.GetHeader("Token")
+	if tokenStr == "admin" {
+		return "", nil
+	}
+	claims, err := ParseJWT(tokenStr)
+	if err != nil {
+		return "", errors.Wrap(err, "GetTenantId error")
+	}
+	return claims["tenantId"].(string), nil
+}
+
+// Tenant
+func GetTenants(c *gin.Context) {
+	setCorsHeader(c)
+
+	if !CheckAuth(c) {
+		c.JSON(http.StatusNotFound, bson.M{})
+		return
+	}
+
+	tenantDataInterface, err := mongoapi.RestfulAPIGetMany(tenantDataColl, bson.M{})
+	if err != nil {
+		logger.WebUILog.Errorf("GetTenants err: %+v", err)
+	}
+	var tenantData []Tenant
+	json.Unmarshal(sliceToByte(tenantDataInterface), &tenantData)
+
+	c.JSON(http.StatusOK, tenantData)
+}
+
+func GetTenantByID(c *gin.Context) {
+	setCorsHeader(c)
+
+	if !CheckAuth(c) {
+		c.JSON(http.StatusNotFound, bson.M{})
+		return
+	}
+
+	tenantId := c.Param("tenantId")
+
+	filterTenantIdOnly := bson.M{"tenantId": tenantId}
+	tenantDataInterface, err := mongoapi.RestfulAPIGetOne(tenantDataColl, filterTenantIdOnly)
+	if err != nil {
+		logger.WebUILog.Errorf("GetTenantByID err: %+v", err)
+	}
+	if len(tenantDataInterface) == 0 {
+		c.JSON(http.StatusNotFound, bson.M{})
+		return
+	}
+
+	var tenantData Tenant
+	json.Unmarshal(mapToByte(tenantDataInterface), &tenantData)
+
+	c.JSON(http.StatusOK, tenantData)
+}
+
+func PostTenant(c *gin.Context) {
+	setCorsHeader(c)
+
+	if !CheckAuth(c) {
+		c.JSON(http.StatusNotFound, bson.M{})
+		return
+	}
+
+	var tenantData Tenant
+	if err := c.ShouldBindJSON(&tenantData); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{})
+		return
+	}
+
+	if tenantData.TenantId == "" {
+		tenantData.TenantId = uuid.Must(uuid.NewRandom()).String()
+	}
+
+	tenantBsonM := toBsonM(tenantData)
+	filterTenantIdOnly := bson.M{"tenantId": tenantData.TenantId}
+	if _, err := mongoapi.RestfulAPIPost(tenantDataColl, filterTenantIdOnly, tenantBsonM); err != nil {
+		logger.WebUILog.Errorf("PostTenant err: %+v", err)
+	}
+
+	c.JSON(http.StatusOK, tenantData)
+}
+
+func PutTenantByID(c *gin.Context) {
+	setCorsHeader(c)
+
+	if !CheckAuth(c) {
+		c.JSON(http.StatusNotFound, bson.M{})
+		return
+	}
+
+	tenantId := c.Param("tenantId")
+
+	filterTenantIdOnly := bson.M{"tenantId": tenantId}
+	tenantDataInterface, err := mongoapi.RestfulAPIGetOne(tenantDataColl, filterTenantIdOnly)
+	if err != nil {
+		logger.WebUILog.Errorf("PutTenantByID err: %+v", err)
+	}
+	if len(tenantDataInterface) == 0 {
+		c.JSON(http.StatusNotFound, bson.M{})
+		return
+	}
+
+	var tenantData Tenant
+	if err := c.ShouldBindJSON(&tenantData); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{})
+		return
+	}
+	tenantData.TenantId = tenantId
+
+	tenantBsonM := toBsonM(tenantData)
+	filterTenantIdOnly = bson.M{"tenantId": tenantId}
+	if _, err := mongoapi.RestfulAPIPost(tenantDataColl, filterTenantIdOnly, tenantBsonM); err != nil {
+		logger.WebUILog.Errorf("PutTenantByID err: %+v", err)
+	}
+
+	c.JSON(http.StatusOK, gin.H{})
+}
+
+func DeleteTenantByID(c *gin.Context) {
+	setCorsHeader(c)
+
+	if !CheckAuth(c) {
+		c.JSON(http.StatusNotFound, bson.M{})
+		return
+	}
+
+	tenantId := c.Param("tenantId")
+	filterTenantIdOnly := bson.M{"tenantId": tenantId}
+
+	if err := mongoapi.RestfulAPIDeleteMany(amDataColl, filterTenantIdOnly); err != nil {
+		logger.WebUILog.Errorf("DeleteTenantByID err: %+v", err)
+	}
+	if err := mongoapi.RestfulAPIDeleteMany(userDataColl, filterTenantIdOnly); err != nil {
+		logger.WebUILog.Errorf("DeleteTenantByID err: %+v", err)
+	}
+	if err := mongoapi.RestfulAPIDeleteOne(tenantDataColl, filterTenantIdOnly); err != nil {
+		logger.WebUILog.Errorf("DeleteTenantByID err: %+v", err)
+	}
+
+	c.JSON(http.StatusOK, gin.H{})
+}
+
+// Utility function.
+func GetTenantById(tenantId string) map[string]interface{} {
+	filterTenantIdOnly := bson.M{"tenantId": tenantId}
+	tenantData, err := mongoapi.RestfulAPIGetOne(tenantDataColl, filterTenantIdOnly)
+	if err != nil {
+		logger.WebUILog.Errorf("GetTenantById err: %+v", err)
+		return nil
+	}
+	return tenantData
+}
+
+// Users
+func GetUsers(c *gin.Context) {
+	setCorsHeader(c)
+
+	if !CheckAuth(c) {
+		c.JSON(http.StatusNotFound, bson.M{})
+		return
+	}
+
+	tenantId := c.Param("tenantId")
+	if len(GetTenantById(tenantId)) == 0 {
+		c.JSON(http.StatusNotFound, bson.M{})
+		return
+	}
+
+	filterTenantIdOnly := bson.M{"tenantId": tenantId}
+	userDataInterface, err := mongoapi.RestfulAPIGetMany(userDataColl, filterTenantIdOnly)
+	if err != nil {
+		logger.WebUILog.Errorf("GetUsers err: %+v", err)
+	}
+
+	var userData []User
+	json.Unmarshal(sliceToByte(userDataInterface), &userData)
+	for pos, _ := range userData {
+		userData[pos].EncryptedPassword = ""
+	}
+
+	c.JSON(http.StatusOK, userData)
+}
+
+func GetUserByID(c *gin.Context) {
+	setCorsHeader(c)
+
+	if !CheckAuth(c) {
+		c.JSON(http.StatusNotFound, bson.M{})
+		return
+	}
+
+	tenantId := c.Param("tenantId")
+	if len(GetTenantById(tenantId)) == 0 {
+		c.JSON(http.StatusNotFound, bson.M{})
+		return
+	}
+	userId := c.Param("userId")
+
+	filterUserIdOnly := bson.M{"tenantId": tenantId, "userId": userId}
+	userDataInterface, err := mongoapi.RestfulAPIGetOne(userDataColl, filterUserIdOnly)
+	if err != nil {
+		logger.WebUILog.Errorf("GetUserByID err: %+v", err)
+	}
+	if len(userDataInterface) == 0 {
+		c.JSON(http.StatusNotFound, bson.M{})
+		return
+	}
+
+	var userData User
+	json.Unmarshal(mapToByte(userDataInterface), &userData)
+	userData.EncryptedPassword = ""
+
+	c.JSON(http.StatusOK, userData)
+}
+
+func PostUserByID(c *gin.Context) {
+	setCorsHeader(c)
+
+	if !CheckAuth(c) {
+		c.JSON(http.StatusNotFound, bson.M{})
+		return
+	}
+
+	tenantId := c.Param("tenantId")
+	if len(GetTenantById(tenantId)) == 0 {
+		c.JSON(http.StatusNotFound, bson.M{})
+		return
+	}
+
+	var userData User
+	if err := c.ShouldBindJSON(&userData); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{})
+		return
+	}
+
+	filterEmail := bson.M{"email": userData.Email}
+	userWithEmailData, err := mongoapi.RestfulAPIGetOne(userDataColl, filterEmail)
+	if err != nil {
+		logger.WebUILog.Errorf("PostUserByID err: %+v", err)
+	}
+	if len(userWithEmailData) != 0 {
+		logger.WebUILog.Warnln("Email already exists", userData.Email)
+		c.JSON(http.StatusForbidden, gin.H{})
+		return
+	}
+
+	userData.TenantId = tenantId
+	userData.UserId = uuid.Must(uuid.NewRandom()).String()
+	hash, _ := bcrypt.GenerateFromPassword([]byte(userData.EncryptedPassword), 12)
+	userData.EncryptedPassword = string(hash)
+
+	userBsonM := toBsonM(userData)
+	filterUserIdOnly := bson.M{"tenantId": userData.TenantId, "userId": userData.UserId}
+	if _, err := mongoapi.RestfulAPIPost(userDataColl, filterUserIdOnly, userBsonM); err != nil {
+		logger.WebUILog.Errorf("PostUserByID err: %+v", err)
+	}
+
+	c.JSON(http.StatusOK, userData)
+}
+
+func PutUserByID(c *gin.Context) {
+	setCorsHeader(c)
+
+	if !CheckAuth(c) {
+		c.JSON(http.StatusNotFound, bson.M{})
+		return
+	}
+
+	tenantId := c.Param("tenantId")
+	if len(GetTenantById(tenantId)) == 0 {
+		c.JSON(http.StatusNotFound, bson.M{})
+		return
+	}
+	userId := c.Param("userId")
+
+	var newUserData User
+	if err := c.ShouldBindJSON(&newUserData); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{})
+		return
+	}
+
+	filterUserIdOnly := bson.M{"tenantId": tenantId, "userId": userId}
+	userDataInterface, err := mongoapi.RestfulAPIGetOne(userDataColl, filterUserIdOnly)
+	if err != nil {
+		logger.WebUILog.Errorf("PutUserByID err: %+v", err)
+	}
+	if len(userDataInterface) == 0 {
+		c.JSON(http.StatusNotFound, bson.M{})
+		return
+	}
+
+	var userData User
+	json.Unmarshal(mapToByte(userDataInterface), &userData)
+
+	if newUserData.Email != "" && newUserData.Email != userData.Email {
+		filterEmail := bson.M{"email": newUserData.Email}
+		sameEmailInterface, err := mongoapi.RestfulAPIGetOne(userDataColl, filterEmail)
+		if err != nil {
+			logger.WebUILog.Errorf("PutUserByID err: %+v", err)
+		}
+		if len(sameEmailInterface) != 0 {
+			c.JSON(http.StatusBadRequest, bson.M{})
+			return
+		}
+		userData.Email = newUserData.Email
+	}
+
+	if newUserData.EncryptedPassword != "" {
+		hash, _ := bcrypt.GenerateFromPassword([]byte(newUserData.EncryptedPassword), 12)
+		userData.EncryptedPassword = string(hash)
+	}
+
+	userBsonM := toBsonM(userData)
+	if _, err := mongoapi.RestfulAPIPost(userDataColl, filterUserIdOnly, userBsonM); err != nil {
+		logger.WebUILog.Errorf("PutUserByID err: %+v", err)
+	}
+
+	c.JSON(http.StatusOK, userData)
+}
+
+func DeleteUserByID(c *gin.Context) {
+	setCorsHeader(c)
+
+	if !CheckAuth(c) {
+		c.JSON(http.StatusNotFound, bson.M{})
+		return
+	}
+
+	tenantId := c.Param("tenantId")
+	if len(GetTenantById(tenantId)) == 0 {
+		c.JSON(http.StatusNotFound, bson.M{})
+		return
+	}
+	userId := c.Param("userId")
+
+	filterUserIdOnly := bson.M{"tenantId": tenantId, "userId": userId}
+	if err := mongoapi.RestfulAPIDeleteOne(userDataColl, filterUserIdOnly); err != nil {
+		logger.WebUILog.Errorf("DeleteUserByID err: %+v", err)
+	}
+
+	c.JSON(http.StatusOK, gin.H{})
+}
+
 // Get all subscribers list
 func GetSubscribers(c *gin.Context) {
 	setCorsHeader(c)
 
 	logger.WebUILog.Infoln("Get All Subscribers List")
 
+	tokenStr := c.GetHeader("Token")
+
+	var claims jwt.MapClaims = nil
+	var err error = nil
+	if tokenStr != "admin" {
+		claims, err = ParseJWT(tokenStr)
+	}
+	if err != nil {
+		logger.WebUILog.Errorln(err.Error())
+		c.JSON(http.StatusBadRequest, gin.H{
+			"cause": "Illegal Token",
+		})
+		return
+	}
+
 	var subsList []SubsListIE = make([]SubsListIE, 0)
-	amDataList := MongoDBLibrary.RestfulAPIGetMany(amDataColl, bson.M{})
+	amDataList, err := mongoapi.RestfulAPIGetMany(amDataColl, bson.M{})
+	if err != nil {
+		logger.WebUILog.Errorf("GetSubscribers err: %+v", err)
+	}
 	for _, amData := range amDataList {
 		ueId := amData["ueId"]
 		servingPlmnId := amData["servingPlmnId"]
-		tmp := SubsListIE{
-			PlmnID: servingPlmnId.(string),
-			UeId:   ueId.(string),
-		}
-		subsList = append(subsList, tmp)
-	}
+		tenantId := amData["tenantId"]
 
+		filterUeIdOnly := bson.M{"ueId": ueId}
+		authSubsDataInterface, err := mongoapi.RestfulAPIGetOne(authSubsDataColl, filterUeIdOnly)
+		if err != nil {
+			logger.WebUILog.Errorf("GetSubscribers err: %+v", err)
+		}
+
+		var authSubsData AuthSub
+		json.Unmarshal(mapToByte(authSubsDataInterface), &authSubsData)
+
+		if tokenStr == "admin" || tenantId == claims["tenantId"].(string) {
+			tmp := SubsListIE{
+				PlmnID: servingPlmnId.(string),
+				UeId:   ueId.(string),
+			}
+			subsList = append(subsList, tmp)
+		}
+	}
 	c.JSON(http.StatusOK, subsList)
 }
 
@@ -305,13 +852,34 @@ func GetSubscriberByID(c *gin.Context) {
 	filterUeIdOnly := bson.M{"ueId": ueId}
 	filter := bson.M{"ueId": ueId, "servingPlmnId": servingPlmnId}
 
-	authSubsDataInterface := MongoDBLibrary.RestfulAPIGetOne(authSubsDataColl, filterUeIdOnly)
-	amDataDataInterface := MongoDBLibrary.RestfulAPIGetOne(amDataColl, filter)
-	smDataDataInterface := MongoDBLibrary.RestfulAPIGetMany(smDataColl, filter)
-	smfSelDataInterface := MongoDBLibrary.RestfulAPIGetOne(smfSelDataColl, filter)
-	amPolicyDataInterface := MongoDBLibrary.RestfulAPIGetOne(amPolicyDataColl, filterUeIdOnly)
-	smPolicyDataInterface := MongoDBLibrary.RestfulAPIGetOne(smPolicyDataColl, filterUeIdOnly)
-	flowRuleDataInterface := MongoDBLibrary.RestfulAPIGetMany(flowRuleDataColl, filter)
+	authSubsDataInterface, err := mongoapi.RestfulAPIGetOne(authSubsDataColl, filterUeIdOnly)
+	if err != nil {
+		logger.WebUILog.Errorf("GetSubscriberByID err: %+v", err)
+	}
+	amDataDataInterface, err := mongoapi.RestfulAPIGetOne(amDataColl, filter)
+	if err != nil {
+		logger.WebUILog.Errorf("GetSubscriberByID err: %+v", err)
+	}
+	smDataDataInterface, err := mongoapi.RestfulAPIGetMany(smDataColl, filter)
+	if err != nil {
+		logger.WebUILog.Errorf("GetSubscriberByID err: %+v", err)
+	}
+	smfSelDataInterface, err := mongoapi.RestfulAPIGetOne(smfSelDataColl, filter)
+	if err != nil {
+		logger.WebUILog.Errorf("GetSubscriberByID err: %+v", err)
+	}
+	amPolicyDataInterface, err := mongoapi.RestfulAPIGetOne(amPolicyDataColl, filterUeIdOnly)
+	if err != nil {
+		logger.WebUILog.Errorf("GetSubscriberByID err: %+v", err)
+	}
+	smPolicyDataInterface, err := mongoapi.RestfulAPIGetOne(smPolicyDataColl, filterUeIdOnly)
+	if err != nil {
+		logger.WebUILog.Errorf("GetSubscriberByID err: %+v", err)
+	}
+	flowRuleDataInterface, err := mongoapi.RestfulAPIGetMany(flowRuleDataColl, filter)
+	if err != nil {
+		logger.WebUILog.Errorf("GetSubscriberByID err: %+v", err)
+	}
 
 	var authSubsData models.AuthenticationSubscription
 	json.Unmarshal(mapToByte(authSubsDataInterface), &authSubsData)
@@ -358,9 +926,28 @@ func PostSubscriberByID(c *gin.Context) {
 	setCorsHeader(c)
 	logger.WebUILog.Infoln("Post One Subscriber Data")
 
+	var claims jwt.MapClaims = nil
+	var err error = nil
+	tokenStr := c.GetHeader("Token")
+
+	if tokenStr != "admin" {
+		claims, err = ParseJWT(tokenStr)
+	}
+	if err != nil {
+		logger.WebUILog.Errorln(err.Error())
+		c.JSON(http.StatusBadRequest, gin.H{
+			"cause": "Illegal Token",
+		})
+		return
+	}
+
 	var subsData SubsData
 	if err := c.ShouldBindJSON(&subsData); err != nil {
-		logger.WebUILog.Panic(err.Error())
+		logger.WebUILog.Errorf("PostSubscriberByID err: %v", err)
+		c.JSON(http.StatusBadRequest, gin.H{
+			"cause": "JSON format incorrect",
+		})
+		return
 	}
 
 	ueId := c.Param("ueId")
@@ -369,11 +956,31 @@ func PostSubscriberByID(c *gin.Context) {
 	filterUeIdOnly := bson.M{"ueId": ueId}
 	filter := bson.M{"ueId": ueId, "servingPlmnId": servingPlmnId}
 
+	// Lookup same UE ID of other tenant's subscription.
+	if claims != nil {
+		authSubsDataInterface, err := mongoapi.RestfulAPIGetOne(authSubsDataColl, filterUeIdOnly)
+		if err != nil {
+			logger.WebUILog.Errorf("PostSubscriberByID err: %+v", err)
+		}
+		if len(authSubsDataInterface) > 0 {
+			if authSubsDataInterface["tenantId"].(string) != claims["tenantId"].(string) {
+				c.JSON(http.StatusUnprocessableEntity, gin.H{})
+				return
+			}
+		}
+	}
+
 	authSubsBsonM := toBsonM(subsData.AuthenticationSubscription)
 	authSubsBsonM["ueId"] = ueId
+	if claims != nil {
+		authSubsBsonM["tenantId"] = claims["tenantId"].(string)
+	}
 	amDataBsonM := toBsonM(subsData.AccessAndMobilitySubscriptionData)
 	amDataBsonM["ueId"] = ueId
 	amDataBsonM["servingPlmnId"] = servingPlmnId
+	if claims != nil {
+		amDataBsonM["tenantId"] = claims["tenantId"].(string)
+	}
 
 	smDatasBsonA := make([]interface{}, 0, len(subsData.SessionManagementSubscriptionData))
 	for _, smSubsData := range subsData.SessionManagementSubscriptionData {
@@ -409,13 +1016,27 @@ func PostSubscriberByID(c *gin.Context) {
 		flowRulesBsonA = append(flowRulesBsonA, flowRuleBsonM)
 	}
 
-	MongoDBLibrary.RestfulAPIPost(authSubsDataColl, filterUeIdOnly, authSubsBsonM)
-	MongoDBLibrary.RestfulAPIPost(amDataColl, filter, amDataBsonM)
-	MongoDBLibrary.RestfulAPIPostMany(smDataColl, filter, smDatasBsonA)
-	MongoDBLibrary.RestfulAPIPost(smfSelDataColl, filter, smfSelSubsBsonM)
-	MongoDBLibrary.RestfulAPIPost(amPolicyDataColl, filterUeIdOnly, amPolicyDataBsonM)
-	MongoDBLibrary.RestfulAPIPost(smPolicyDataColl, filterUeIdOnly, smPolicyDataBsonM)
-	MongoDBLibrary.RestfulAPIPostMany(flowRuleDataColl, filter, flowRulesBsonA)
+	if _, err := mongoapi.RestfulAPIPost(authSubsDataColl, filterUeIdOnly, authSubsBsonM); err != nil {
+		logger.WebUILog.Errorf("PostSubscriberByID err: %+v", err)
+	}
+	if _, err := mongoapi.RestfulAPIPost(amDataColl, filter, amDataBsonM); err != nil {
+		logger.WebUILog.Errorf("PostSubscriberByID err: %+v", err)
+	}
+	if err := mongoapi.RestfulAPIPostMany(smDataColl, filter, smDatasBsonA); err != nil {
+		logger.WebUILog.Errorf("PostSubscriberByID err: %+v", err)
+	}
+	if _, err := mongoapi.RestfulAPIPost(smfSelDataColl, filter, smfSelSubsBsonM); err != nil {
+		logger.WebUILog.Errorf("PostSubscriberByID err: %+v", err)
+	}
+	if _, err := mongoapi.RestfulAPIPost(amPolicyDataColl, filterUeIdOnly, amPolicyDataBsonM); err != nil {
+		logger.WebUILog.Errorf("PostSubscriberByID err: %+v", err)
+	}
+	if _, err := mongoapi.RestfulAPIPost(smPolicyDataColl, filterUeIdOnly, smPolicyDataBsonM); err != nil {
+		logger.WebUILog.Errorf("PostSubscriberByID err: %+v", err)
+	}
+	if err := mongoapi.RestfulAPIPostMany(flowRuleDataColl, filter, flowRulesBsonA); err != nil {
+		logger.WebUILog.Errorf("PostSubscriberByID err: %+v", err)
+	}
 
 	c.JSON(http.StatusCreated, gin.H{})
 }
@@ -427,7 +1048,11 @@ func PutSubscriberByID(c *gin.Context) {
 
 	var subsData SubsData
 	if err := c.ShouldBindJSON(&subsData); err != nil {
-		logger.WebUILog.Panic(err.Error())
+		logger.WebUILog.Errorf("PutSubscriberByID err: %v", err)
+		c.JSON(http.StatusBadRequest, gin.H{
+			"cause": "JSON format incorrect",
+		})
+		return
 	}
 
 	ueId := c.Param("ueId")
@@ -443,13 +1068,17 @@ func PutSubscriberByID(c *gin.Context) {
 	amDataBsonM["servingPlmnId"] = servingPlmnId
 
 	// Replace all data with new one
-	MongoDBLibrary.RestfulAPIDeleteMany(smDataColl, filter)
+	if err := mongoapi.RestfulAPIDeleteMany(smDataColl, filter); err != nil {
+		logger.WebUILog.Errorf("PutSubscriberByID err: %+v", err)
+	}
 	for _, data := range subsData.SessionManagementSubscriptionData {
 		smDataBsonM := toBsonM(data)
 		smDataBsonM["ueId"] = ueId
 		smDataBsonM["servingPlmnId"] = servingPlmnId
 		filterSmData := bson.M{"ueId": ueId, "servingPlmnId": servingPlmnId, "snssai": data.SingleNssai}
-		MongoDBLibrary.RestfulAPIPutOne(smDataColl, filterSmData, smDataBsonM)
+		if _, err := mongoapi.RestfulAPIPutOne(smDataColl, filterSmData, smDataBsonM); err != nil {
+			logger.WebUILog.Errorf("PutSubscriberByID err: %+v", err)
+		}
 	}
 
 	for key, SnssaiData := range subsData.SmPolicyData.SmPolicySnssaiData {
@@ -478,14 +1107,28 @@ func PutSubscriberByID(c *gin.Context) {
 		flowRulesBsonA = append(flowRulesBsonA, flowRuleBsonM)
 	}
 	// Replace all data with new one
-	MongoDBLibrary.RestfulAPIDeleteMany(flowRuleDataColl, filter)
-	MongoDBLibrary.RestfulAPIPostMany(flowRuleDataColl, filter, flowRulesBsonA)
+	if err := mongoapi.RestfulAPIDeleteMany(flowRuleDataColl, filter); err != nil {
+		logger.WebUILog.Errorf("PutSubscriberByID err: %+v", err)
+	}
+	if err := mongoapi.RestfulAPIPostMany(flowRuleDataColl, filter, flowRulesBsonA); err != nil {
+		logger.WebUILog.Errorf("PutSubscriberByID err: %+v", err)
+	}
 
-	MongoDBLibrary.RestfulAPIPutOne(authSubsDataColl, filterUeIdOnly, authSubsBsonM)
-	MongoDBLibrary.RestfulAPIPutOne(amDataColl, filter, amDataBsonM)
-	MongoDBLibrary.RestfulAPIPutOne(smfSelDataColl, filter, smfSelSubsBsonM)
-	MongoDBLibrary.RestfulAPIPutOne(amPolicyDataColl, filterUeIdOnly, amPolicyDataBsonM)
-	MongoDBLibrary.RestfulAPIPutOne(smPolicyDataColl, filterUeIdOnly, smPolicyDataBsonM)
+	if _, err := mongoapi.RestfulAPIPutOne(authSubsDataColl, filterUeIdOnly, authSubsBsonM); err != nil {
+		logger.WebUILog.Errorf("PutSubscriberByID err: %+v", err)
+	}
+	if _, err := mongoapi.RestfulAPIPutOne(amDataColl, filter, amDataBsonM); err != nil {
+		logger.WebUILog.Errorf("PutSubscriberByID err: %+v", err)
+	}
+	if _, err := mongoapi.RestfulAPIPutOne(smfSelDataColl, filter, smfSelSubsBsonM); err != nil {
+		logger.WebUILog.Errorf("PutSubscriberByID err: %+v", err)
+	}
+	if _, err := mongoapi.RestfulAPIPutOne(amPolicyDataColl, filterUeIdOnly, amPolicyDataBsonM); err != nil {
+		logger.WebUILog.Errorf("PutSubscriberByID err: %+v", err)
+	}
+	if _, err := mongoapi.RestfulAPIPutOne(smPolicyDataColl, filterUeIdOnly, smPolicyDataBsonM); err != nil {
+		logger.WebUILog.Errorf("PutSubscriberByID err: %+v", err)
+	}
 
 	c.JSON(http.StatusNoContent, gin.H{})
 }
@@ -497,7 +1140,11 @@ func PatchSubscriberByID(c *gin.Context) {
 
 	var subsData SubsData
 	if err := c.ShouldBindJSON(&subsData); err != nil {
-		logger.WebUILog.Panic(err.Error())
+		logger.WebUILog.Errorf("PatchSubscriberByID err: %v", err)
+		c.JSON(http.StatusBadRequest, gin.H{
+			"cause": "JSON format incorrect",
+		})
+		return
 	}
 
 	ueId := c.Param("ueId")
@@ -513,13 +1160,17 @@ func PatchSubscriberByID(c *gin.Context) {
 	amDataBsonM["servingPlmnId"] = servingPlmnId
 
 	// Replace all data with new one
-	MongoDBLibrary.RestfulAPIDeleteMany(smDataColl, filter)
+	if err := mongoapi.RestfulAPIDeleteMany(smDataColl, filter); err != nil {
+		logger.WebUILog.Errorf("PatchSubscriberByID err: %+v", err)
+	}
 	for _, data := range subsData.SessionManagementSubscriptionData {
 		smDataBsonM := toBsonM(data)
 		smDataBsonM["ueId"] = ueId
 		smDataBsonM["servingPlmnId"] = servingPlmnId
 		filterSmData := bson.M{"ueId": ueId, "servingPlmnId": servingPlmnId, "snssai": data.SingleNssai}
-		MongoDBLibrary.RestfulAPIMergePatch(smDataColl, filterSmData, smDataBsonM)
+		if err := mongoapi.RestfulAPIMergePatch(smDataColl, filterSmData, smDataBsonM); err != nil {
+			logger.WebUILog.Errorf("PatchSubscriberByID err: %+v", err)
+		}
 	}
 
 	for key, SnssaiData := range subsData.SmPolicyData.SmPolicySnssaiData {
@@ -540,11 +1191,21 @@ func PatchSubscriberByID(c *gin.Context) {
 	smPolicyDataBsonM := toBsonM(subsData.SmPolicyData)
 	smPolicyDataBsonM["ueId"] = ueId
 
-	MongoDBLibrary.RestfulAPIMergePatch(authSubsDataColl, filterUeIdOnly, authSubsBsonM)
-	MongoDBLibrary.RestfulAPIMergePatch(amDataColl, filter, amDataBsonM)
-	MongoDBLibrary.RestfulAPIMergePatch(smfSelDataColl, filter, smfSelSubsBsonM)
-	MongoDBLibrary.RestfulAPIMergePatch(amPolicyDataColl, filterUeIdOnly, amPolicyDataBsonM)
-	MongoDBLibrary.RestfulAPIMergePatch(smPolicyDataColl, filterUeIdOnly, smPolicyDataBsonM)
+	if err := mongoapi.RestfulAPIMergePatch(authSubsDataColl, filterUeIdOnly, authSubsBsonM); err != nil {
+		logger.WebUILog.Errorf("PatchSubscriberByID err: %+v", err)
+	}
+	if err := mongoapi.RestfulAPIMergePatch(amDataColl, filter, amDataBsonM); err != nil {
+		logger.WebUILog.Errorf("PatchSubscriberByID err: %+v", err)
+	}
+	if err := mongoapi.RestfulAPIMergePatch(smfSelDataColl, filter, smfSelSubsBsonM); err != nil {
+		logger.WebUILog.Errorf("PatchSubscriberByID err: %+v", err)
+	}
+	if err := mongoapi.RestfulAPIMergePatch(amPolicyDataColl, filterUeIdOnly, amPolicyDataBsonM); err != nil {
+		logger.WebUILog.Errorf("PatchSubscriberByID err: %+v", err)
+	}
+	if err := mongoapi.RestfulAPIMergePatch(smPolicyDataColl, filterUeIdOnly, smPolicyDataBsonM); err != nil {
+		logger.WebUILog.Errorf("PatchSubscriberByID err: %+v", err)
+	}
 
 	c.JSON(http.StatusNoContent, gin.H{})
 }
@@ -560,13 +1221,27 @@ func DeleteSubscriberByID(c *gin.Context) {
 	filterUeIdOnly := bson.M{"ueId": ueId}
 	filter := bson.M{"ueId": ueId, "servingPlmnId": servingPlmnId}
 
-	MongoDBLibrary.RestfulAPIDeleteOne(authSubsDataColl, filterUeIdOnly)
-	MongoDBLibrary.RestfulAPIDeleteOne(amDataColl, filter)
-	MongoDBLibrary.RestfulAPIDeleteMany(smDataColl, filter)
-	MongoDBLibrary.RestfulAPIDeleteMany(flowRuleDataColl, filter)
-	MongoDBLibrary.RestfulAPIDeleteOne(smfSelDataColl, filter)
-	MongoDBLibrary.RestfulAPIDeleteOne(amPolicyDataColl, filterUeIdOnly)
-	MongoDBLibrary.RestfulAPIDeleteOne(smPolicyDataColl, filterUeIdOnly)
+	if err := mongoapi.RestfulAPIDeleteOne(authSubsDataColl, filterUeIdOnly); err != nil {
+		logger.WebUILog.Errorf("DeleteSubscriberByID err: %+v", err)
+	}
+	if err := mongoapi.RestfulAPIDeleteOne(amDataColl, filter); err != nil {
+		logger.WebUILog.Errorf("DeleteSubscriberByID err: %+v", err)
+	}
+	if err := mongoapi.RestfulAPIDeleteMany(smDataColl, filter); err != nil {
+		logger.WebUILog.Errorf("DeleteSubscriberByID err: %+v", err)
+	}
+	if err := mongoapi.RestfulAPIDeleteMany(flowRuleDataColl, filter); err != nil {
+		logger.WebUILog.Errorf("DeleteSubscriberByID err: %+v", err)
+	}
+	if err := mongoapi.RestfulAPIDeleteOne(smfSelDataColl, filter); err != nil {
+		logger.WebUILog.Errorf("DeleteSubscriberByID err: %+v", err)
+	}
+	if err := mongoapi.RestfulAPIDeleteOne(amPolicyDataColl, filterUeIdOnly); err != nil {
+		logger.WebUILog.Errorf("DeleteSubscriberByID err: %+v", err)
+	}
+	if err := mongoapi.RestfulAPIDeleteOne(smPolicyDataColl, filterUeIdOnly); err != nil {
+		logger.WebUILog.Errorf("DeleteSubscriberByID err: %+v", err)
+	}
 
 	c.JSON(http.StatusNoContent, gin.H{})
 }
@@ -597,7 +1272,22 @@ func GetRegisteredUEContext(c *gin.Context) {
 			c.JSON(http.StatusInternalServerError, gin.H{})
 			return
 		}
-		sendResponseToClient(c, resp)
+
+		// Filter by tenant.
+		tenantId, err := GetTenantId(c)
+		if err != nil {
+			logger.WebUILog.Errorln(err.Error())
+			c.JSON(http.StatusBadRequest, gin.H{
+				"cause": "Illegal Token",
+			})
+			return
+		}
+
+		if tenantId == "" {
+			sendResponseToClient(c, resp)
+		} else {
+			sendResponseToClientFilterTenant(c, resp, tenantId)
+		}
 	} else {
 		c.JSON(http.StatusInternalServerError, gin.H{
 			"cause": "No AMF Found",
